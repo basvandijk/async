@@ -1,4 +1,6 @@
-{-# LANGUAGE CPP, MagicHash, UnboxedTuples, RankNTypes #-}
+{-# LANGUAGE CPP, MagicHash, UnboxedTuples, RankNTypes,
+             ScopedTypeVariables, DeriveDataTypeable,
+             ExistentialQuantification #-}
 #if __GLASGOW_HASKELL__ >= 701
 {-# LANGUAGE Trustworthy #-}
 #endif
@@ -123,6 +125,9 @@ import Prelude hiding (catch)
 import Control.Monad
 import Control.Applicative
 import Data.Traversable
+import Data.Typeable
+import Data.Unique
+import Unsafe.Coerce
 
 import GHC.Exts
 import GHC.IO hiding (finally, onException)
@@ -486,44 +491,90 @@ concurrently left right =
 -- MVar versions of race/concurrently
 -- More ugly than the Async versions, but quite a bit faster.
 
+-- @race left right@ forks a thread to perform the @left@ computation and
+-- performs the @right@ computation in the current thread. When one of them
+-- terminates, whether normally or by raising an exception, the other thread is
+-- interrupt by way of a specially crafted asynchronous exception.
+--
+-- More concretely:
+--
+-- * When @left@ terminates, whether normally or by raising an
+--   exception, it wraps its result in the 'InterruptRight' exception
+--   and throw it to the right thread.
+--
+-- * When the right thread catches the 'InterruptRight' exception it
+--   will either throw the contained exception or return the normal
+--   result.
+--
+-- * When @right@ terminates, whether normally or by raising an
+--   exception, it throws an 'InterruptLeft' exception to the left
+--   thread in order to stop that thread from doing any more work.
+--
+-- Because calls to @race@ can be nested it's important that different
+-- 'InterruptLeft' or 'InterruptRight' exceptions are not mixed-up. For this
+-- reason each call to @race@ creates a 'Unique' value that gets embedded in the
+-- interrupt exceptions being thrown. When catching the interrupt exceptions we
+-- check if the Unique equals the Unique of this invocation of @race@. (This is
+-- the same trick used in the Timeout exception from System.Timeout).
+
 -- race :: IO a -> IO b -> IO (Either a b)
-race left right = concurrently' left right collect
-  where
-    collect m = do
-        e <- takeMVar m
-        case e of
-            Left ex -> throwIO ex
-            Right r -> return r
+race left right = do
+  rightTid <- myThreadId
+  u <- newUnique
+  mask $ \restore -> do
+    leftTid <- forkIO $
+      catch (do l <- restore left
+                throwTo rightTid $ InterruptRight u $ Right l) $ \e ->
+        case fromException e of
+          Just (InterruptLeft u') | u == u' -> return ()
+          _ -> throwTo rightTid $ InterruptRight u $ Left e
+    catch (do r <- restore right
+              throwTo leftTid $ InterruptLeft u
+              return $ Right r) $ \e ->
+      case fromException e of
+        Just (InterruptRight u' r) | u == u' -> do
+          case r of
+            Left leftEx -> throwIO leftEx
+            Right l -> return $ Left $ unsafeCoerce l
+        _ -> do throwTo leftTid $ InterruptLeft u
+                throwIO e
+
+data InterruptLeft = InterruptLeft Unique deriving (Typeable)
+
+instance Show InterruptLeft where
+    show _ = "<< InterruptLeft >>"
+
+instance Exception InterruptLeft where
+#if MIN_VERSION_base(4,7,0)
+    toException = asyncExceptionToException
+    fromException = asyncExceptionFromException
+#endif
+
+data InterruptRight = forall a. InterruptRight Unique (Either SomeException a)
+                      deriving Typeable
+
+instance Show InterruptRight where
+    show _ = "<< InterruptRight >>"
+
+instance Exception InterruptRight where
+#if MIN_VERSION_base(4,7,0)
+    toException = asyncExceptionToException
+    fromException = asyncExceptionFromException
+#endif
 
 -- race_ :: IO a -> IO b -> IO ()
 race_ left right = void $ race left right
 
 -- concurrently :: IO a -> IO b -> IO (a,b)
-concurrently left right = concurrently' left right (collect [])
-  where
-    collect [Left a, Right b] _ = return (a,b)
-    collect [Right b, Left a] _ = return (a,b)
-    collect xs m = do
-        e <- takeMVar m
-        case e of
-            Left ex -> throwIO ex
-            Right r -> collect (r:xs) m
-
-concurrently' :: IO a -> IO b
-             -> (MVar (Either SomeException (Either a b)) -> IO r)
-             -> IO r
-concurrently' left right collect = do
-    done <- newEmptyMVar
+concurrently left right = do
+    mv <- newEmptyMVar
+    rightTid <- myThreadId
     mask $ \restore -> do
-        lid <- forkIO $ restore (left >>= putMVar done . Right . Left)
-                             `catchAll` (putMVar done . Left)
-        rid <- forkIO $ restore (right >>= putMVar done . Right . Right)
-                             `catchAll` (putMVar done . Left)
-        let stop = killThread lid >> killThread rid
-        r <- restore (collect done) `onException` stop
-        stop
-        return r
-
+      leftTid <- forkIO $ do
+        (restore left >>= putMVar mv) `catchAll` throwTo rightTid
+      (flip (,) <$> restore right <*> takeMVar mv) `catchAll` \e -> do
+        killThread leftTid
+        throwIO e
 #endif
 
 -- | maps an @IO@-performing function over any @Traversable@ data
